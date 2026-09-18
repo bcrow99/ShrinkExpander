@@ -33,9 +33,44 @@ import java.util.ArrayList;
  *   - dilateImageDiagonal(): location_type==4 used '=' instead of '+=' for
  *     its first neighbor accumulation (tested harmless in isolation, but
  *     fixed for consistency/robustness against future edits).
- *   - expandX(double[][], int iterations) returned a throwaway new
- *     double[1][1] instead of the source array when iterations <= 0;
- *     now returns src unchanged in that case.
+ *
+ * version 2.0: added flat int[]/boolean[] (single-array-plus-width)
+ * overloads of the pyramid operators, for consistency with how
+ * DeltaWriter/DeltaReader/DeltaMapper/StringMapper/ResizeMapper represent
+ * images everywhere else in that project (a flat array plus a separate
+ * width, rather than int[][]) -- see the "Pyramid demo operators, flat-
+ * array overloads" section. Genuine standalone implementations, not thin
+ * wrappers that round-trip through the int[][] versions, so no per-call
+ * conversion overhead when chaining many pyramid levels. Also promoted
+ * padTo() from private to public, since DeltaWriter/DeltaReader need to
+ * compute padded dimensions directly.
+ *
+ * version 2.1: reconciled a rounding/scaling inconsistency between
+ * contract() and translate() -- translate() was multiplying its bilinear-
+ * interpolated result by an extra, unexplained 0.5 before truncating,
+ * which put its output at roughly half the intensity contract() produces
+ * from equivalent data, even though the two are compared directly against
+ * each other inside getTranslation()'s refinement loop. That stray 0.5 is
+ * removed, and both methods now round to nearest (contract() previously
+ * truncated) so they share one convention. Also added getRefinedTranslation(),
+ * a coarse-to-fine wrapper around getTranslation(): getTranslation() itself
+ * is documented (via translate()'s "-1 to 1" input range) to only resolve
+ * subpixel offsets, so getRefinedTranslation() repeatedly extracts the
+ * current overlap window from the ORIGINAL full-resolution images, pyramids
+ * it down with avgAreaTransform() to bring any larger residual misalignment
+ * into that subpixel-only operating range, calls getTranslation() there,
+ * rescales the result back to full-resolution units, and tightens the
+ * overlap window before the next round -- stopping when the estimated
+ * correction reverses direction.
+ *
+ * Also fixed in this pass: avgAreaTransform(int[][], int, int)'s final
+ * copy-back loop iterated "j < xdim" (the pre-shrink width) instead of
+ * "j < new_xdim" -- harmless when growing, but threw
+ * ArrayIndexOutOfBoundsException whenever shrinking to a new_xdim smaller
+ * than the original width, which is the normal case and exactly what
+ * getRefinedTranslation() does at every iteration. Found by actually
+ * running getRefinedTranslation() end to end rather than only reading
+ * the code.
  */
 public class ImageMapper {
 
@@ -229,6 +264,41 @@ public class ImageMapper {
         return (int) v;
     }
 
+    // Parameterized clamp, used only by the flat-array pyramid methods
+    // below -- DeltaWriter/DeltaReader can legitimately hand these a
+    // DIFFERENCE channel (blue-green, red-green, red-blue), which gets
+    // shifted by its own observed minimum to become non-negative but is
+    // never rescaled, so its values can genuinely run up to 510 (two
+    // [0,255] channels differing by as much as 255 in either direction)
+    // -- not just 255. The int[][] methods above stay hardcoded to 255,
+    // since ShrinkExpander only ever feeds them genuine, always-in-range
+    // RGB channels.
+    private static int clamp(long v, int maxValue) {
+        if (v < 0) return 0;
+        if (v > maxValue) return maxValue;
+        return (int) v;
+    }
+
+    // Damping factor for a set of raw offsets from a center value: the
+    // LARGEST s in [0,1] such that center + s*offset stays within
+    // [0,maxValue] for every offset given. Used instead of clamping each
+    // predicted corner independently -- independent clamping breaks the
+    // exact mean-preservation the unclamped plane-fit formula otherwise
+    // guarantees (the offset terms cancel exactly across the four
+    // corners), which is what turns a graceful falloff into visible
+    // hard-edged noise once pyramid levels chain without correction.
+    // Scaling every offset down by the SAME factor keeps that
+    // cancellation intact -- the corners just converge smoothly toward
+    // the center (blur) instead of individual corners hitting a wall.
+    private static double computeDampingFactor(double center, double[] rawOffsets, int maxValue) {
+        double s = 1.0;
+        for (double off : rawOffsets) {
+            if (off > 0) s = Math.min(s, (maxValue - center) / off);
+            else if (off < 0) s = Math.min(s, center / (-off));
+        }
+        return Math.max(0.0, s);
+    }
+
     // geq[i][j] == true means the original pixel at (i,j) was >= the
     // (rounded) average of the block it came from; false means it was
     // strictly less than that average. This is the one bit of side
@@ -270,7 +340,7 @@ public class ImageMapper {
         return dst;
     }
 
-    private static int padTo(int dim, int multiple) {
+    public static int padTo(int dim, int multiple) {
         int rem = dim % multiple;
         return rem == 0 ? dim : dim + (multiple - rem);
     }
@@ -300,6 +370,225 @@ public class ImageMapper {
             }
         }
         return new double[]{ sumErr / n, sumAbs / n, n };
+    }
+
+    // ===================================================================
+    // Pyramid demo operators, FLAT-ARRAY overloads (version 2.0)
+    //
+    // Genuine standalone implementations operating on a flat int[]/
+    // boolean[] plus a separate width, matching how images are
+    // represented everywhere else in the DeltaWriter/DeltaReader project
+    // (as opposed to int[][] above, used only by ShrinkExpander's demo).
+    // Same algorithms as the int[][] versions above; verified against
+    // them directly (see the accompanying test harness) rather than
+    // assumed identical from a mechanical transcription.
+    // ===================================================================
+
+    public static int[] shrinkAvg(int[] src, int xdim) {
+        int ydim = src.length / xdim;
+        int _xdim = xdim / 2;
+        int _ydim = ydim / 2;
+        int[] dst = new int[_xdim * _ydim];
+        for (int i = 0; i < ydim - 1; i += 2) {
+            int k = i / 2;
+            for (int j = 0; j < xdim - 1; j += 2) {
+                int m = j / 2;
+                dst[k * _xdim + m] = (src[i * xdim + j] + src[i * xdim + j + 1]
+                                     + src[(i + 1) * xdim + j] + src[(i + 1) * xdim + j + 1] + 2) / 4;
+            }
+        }
+        return dst;
+    }
+
+    private static double horizGradFlat(int[] avg, int xdim, int k, int m) {
+        int m0 = Math.max(m - 1, 0);
+        int m1 = Math.min(m + 1, xdim - 1);
+        if (m0 == m1) return 0.0;
+        return (avg[k * xdim + m1] - avg[k * xdim + m0]) / (2.0 * (m1 - m0));
+    }
+
+    private static double vertGradFlat(int[] avg, int xdim, int ydim, int k, int m) {
+        int k0 = Math.max(k - 1, 0);
+        int k1 = Math.min(k + 1, ydim - 1);
+        if (k0 == k1) return 0.0;
+        return (avg[k1 * xdim + m] - avg[k0 * xdim + m]) / (2.0 * (k1 - k0));
+    }
+
+    private static double crossGradFlat(int[] avg, int xdim, int ydim, int k, int m) {
+        int k0 = Math.max(k - 1, 0);
+        int k1 = Math.min(k + 1, ydim - 1);
+        int m0 = Math.max(m - 1, 0);
+        int m1 = Math.min(m + 1, xdim - 1);
+        if (k0 == k1 || m0 == m1) return 0.0;
+        double num = avg[k1 * xdim + m1] - avg[k1 * xdim + m0] - avg[k0 * xdim + m1] + avg[k0 * xdim + m0];
+        double denom = (2.0 * (k1 - k0)) * (2.0 * (m1 - m0));
+        return num / denom;
+    }
+
+    // xdim here is avg's width (the SMALLER, pre-expand width). maxValue
+    // is the legitimate upper bound for THIS channel's values -- 255 for
+    // a raw RGB channel, up to 510 for a shifted difference channel; see
+    // clamp(long,int)'s comment for why this can't just be hardcoded.
+    public static int[] expandGradient(int[] avg, int xdim, int maxValue) {
+        int _xdim = xdim;
+        int _ydim = avg.length / xdim;
+        int ydim = _ydim * 2;
+        int newXdim = _xdim * 2;
+        int[] dst = new int[newXdim * ydim];
+
+        for (int k = 0; k < _ydim; k++) {
+            for (int m = 0; m < _xdim; m++) {
+                double A  = avg[k * _xdim + m];
+                double gx = horizGradFlat(avg, _xdim, k, m);
+                double gy = vertGradFlat(avg, _xdim, _ydim, k, m);
+
+                double[] raw = { -0.5 * gy - 0.5 * gx, -0.5 * gy + 0.5 * gx, 0.5 * gy - 0.5 * gx, 0.5 * gy + 0.5 * gx };
+                double s = computeDampingFactor(A, raw, maxValue);
+
+                int i = 2 * k, j = 2 * m;
+                dst[i * newXdim + j]             = clamp(Math.round(A + s * raw[0]), maxValue);
+                dst[i * newXdim + j + 1]         = clamp(Math.round(A + s * raw[1]), maxValue);
+                dst[(i + 1) * newXdim + j]       = clamp(Math.round(A + s * raw[2]), maxValue);
+                dst[(i + 1) * newXdim + j + 1]   = clamp(Math.round(A + s * raw[3]), maxValue);
+            }
+        }
+        return dst;
+    }
+
+    public static int[] expandGradientSaddle(int[] avg, int xdim, int maxValue) {
+        int _xdim = xdim;
+        int _ydim = avg.length / xdim;
+        int ydim = _ydim * 2;
+        int newXdim = _xdim * 2;
+        int[] dst = new int[newXdim * ydim];
+
+        for (int k = 0; k < _ydim; k++) {
+            for (int m = 0; m < _xdim; m++) {
+                double A   = avg[k * _xdim + m];
+                double gx  = horizGradFlat(avg, _xdim, k, m);
+                double gy  = vertGradFlat(avg, _xdim, _ydim, k, m);
+                double gxy = crossGradFlat(avg, _xdim, _ydim, k, m);
+
+                double[] raw = {
+                    -0.5 * gy - 0.5 * gx + 0.25 * gxy, -0.5 * gy + 0.5 * gx - 0.25 * gxy,
+                    0.5 * gy - 0.5 * gx - 0.25 * gxy,  0.5 * gy + 0.5 * gx + 0.25 * gxy
+                };
+                double s = computeDampingFactor(A, raw, maxValue);
+
+                int i = 2 * k, j = 2 * m;
+                dst[i * newXdim + j]             = clamp(Math.round(A + s * raw[0]), maxValue);
+                dst[i * newXdim + j + 1]         = clamp(Math.round(A + s * raw[1]), maxValue);
+                dst[(i + 1) * newXdim + j]       = clamp(Math.round(A + s * raw[2]), maxValue);
+                dst[(i + 1) * newXdim + j + 1]   = clamp(Math.round(A + s * raw[3]), maxValue);
+            }
+        }
+        return dst;
+    }
+
+    // origXdim is orig's (the LARGER array's) width; avg is half that width.
+    public static boolean[] buildGeqBits(int[] orig, int[] avg, int origXdim) {
+        int h = orig.length / origXdim;
+        int w = origXdim;
+        int avgXdim = w / 2;
+        boolean[] geq = new boolean[h * w];
+        for (int i = 0; i < h; i++) {
+            int k = i / 2;
+            for (int j = 0; j < w; j++) {
+                int m = j / 2;
+                geq[i * w + j] = orig[i * w + j] >= avg[k * avgXdim + m];
+            }
+        }
+        return geq;
+    }
+
+    // predictedXdim is predicted's (the LARGER array's) width; avg is half that width.
+    public static int[] refineWithSignBits(int[] avg, int[] predicted, boolean[] geq, int predictedXdim, int maxValue) {
+        int xdim = predictedXdim;
+        int ydim = predicted.length / predictedXdim;
+        int avgXdim = xdim / 2;
+        int[] dst = new int[predicted.length];
+
+        for (int i = 0; i < ydim - 1; i += 2) {
+            int k = i / 2;
+            for (int j = 0; j < xdim - 1; j += 2) {
+                int m = j / 2;
+                double A = avg[k * avgXdim + m];
+
+                double[] p = {
+                    predicted[i * xdim + j],           predicted[i * xdim + j + 1],
+                    predicted[(i + 1) * xdim + j],     predicted[(i + 1) * xdim + j + 1]
+                };
+                boolean[] bit = {
+                    geq[i * xdim + j],           geq[i * xdim + j + 1],
+                    geq[(i + 1) * xdim + j],     geq[(i + 1) * xdim + j + 1]
+                };
+
+                // If the UNCORRECTED gradient prediction disagrees with
+                // ANY of the 4 sign bits, that's direct evidence the
+                // gradient estimate for this whole block is unreliable
+                // (a real edge or fine detail the plane fit can't
+                // represent) -- not just that one corner. Restarting the
+                // correction from flat (all four = A) instead of from
+                // that untrustworthy prediction avoids the alternative:
+                // three corners keeping their (still-trusted) gradient-
+                // predicted contrast while the fourth gets pulled toward
+                // A alone, which is exactly what produces an isolated,
+                // locally-inconsistent speck. Flattening the whole block
+                // trades some detail for a smooth, coherent one.
+                boolean anyMismatch = false;
+                for (int t = 0; t < 4; t++) if ((p[t] >= A) != bit[t]) anyMismatch = true;
+                if (anyMismatch) { p[0] = p[1] = p[2] = p[3] = A; }
+
+                for (int iter = 0; iter < 10; iter++) {
+                    for (int t = 0; t < 4; t++) {
+                        boolean predGeq = p[t] >= A;
+                        if (predGeq != bit[t]) {
+                            p[t] = bit[t] ? A : A - 1;
+                        }
+                    }
+                    double sum  = p[0] + p[1] + p[2] + p[3];
+                    double corr = (sum - 4 * A) / 4.0;
+                    for (int t = 0; t < 4; t++) p[t] -= corr;
+                }
+
+                // Damp each corner's DEVIATION FROM A (not from 0) rather
+                // than clamping p[t] independently. The POCS loop above
+                // already drives sum(p) to exactly 4A, so damping toward
+                // A preserves that mean exactly regardless of s, and
+                // since A + s*(p[t]-A) stays on the same side of A as
+                // p[t] for any s in [0,1], it can never flip a corner's
+                // sign relative to A -- so it can't undo the sign
+                // constraint the loop above just established.
+                double[] dev = { p[0] - A, p[1] - A, p[2] - A, p[3] - A };
+                double s = computeDampingFactor(A, dev, maxValue);
+
+                dst[i * xdim + j]             = clamp(Math.round(A + s * dev[0]), maxValue);
+                dst[i * xdim + j + 1]         = clamp(Math.round(A + s * dev[1]), maxValue);
+                dst[(i + 1) * xdim + j]       = clamp(Math.round(A + s * dev[2]), maxValue);
+                dst[(i + 1) * xdim + j + 1]   = clamp(Math.round(A + s * dev[3]), maxValue);
+            }
+        }
+        return dst;
+    }
+
+    public static int[] padEdgeReplicate(int[] src, int xdim, int ydim, int newXdim, int newYdim) {
+        if (newXdim == xdim && newYdim == ydim) return src;
+        int[] dst = new int[newXdim * newYdim];
+        for (int y = 0; y < newYdim; y++) {
+            int sy = Math.min(y, ydim - 1);
+            for (int x = 0; x < newXdim; x++) {
+                dst[y * newXdim + x] = src[sy * xdim + Math.min(x, xdim - 1)];
+            }
+        }
+        return dst;
+    }
+
+    public static int[] crop(int[] src, int xdim, int ydim, int newXdim, int newYdim) {
+        int[] dst = new int[newXdim * newYdim];
+        for (int y = 0; y < newYdim; y++) {
+            System.arraycopy(src, y * xdim, dst, y * newXdim, newXdim);
+        }
+        return dst;
     }
 
     // ===================================================================
@@ -1468,13 +1757,19 @@ public class ImageMapper {
 
 		int [] source = new int[xdim * ydim];
 		int [] dest   = new int[xdim * new_ydim];
+		// BUG FIX: same "k reset inside the outer loop" mistake found and
+		// fixed in avgAreaTransform(int[][],int,int) -- the index must
+		// keep advancing across the whole flatten, not restart at 0 each
+		// row. Named srcK (rather than k) to avoid colliding with the
+		// unrelated "int k" used further down this method as a per-block
+		// pixel countdown.
+		int srcK = 0;
 		for (int i = 0; i < ydim; i++)
 		{
-			int k = 0;
 			for (int j = 0; j < xdim; j++)
 			{
-				source[k] = src[i][j];
-				k++;
+				source[srcK] = src[i][j];
+				srcK++;
 			}
 		}
 
@@ -1547,13 +1842,21 @@ public class ImageMapper {
 		}
 
 		int[][] dst = new int[new_ydim][xdim];
+		// BUG FIX: same mistake as in avgAreaTransform(int[][],int,int)'s
+		// copy-back loop above -- "k" was reset to 0 at the start of every
+		// row i, so every output row re-read dest[0..xdim-1] instead of
+		// continuing into dest's next xdim-sized chunk, making every row
+		// of the result identical to row 0. Needs a single flat index
+		// that keeps advancing across the whole copy; named dstK (rather
+		// than k) to avoid colliding with the unrelated "int k" used
+		// earlier in this method as a per-block pixel countdown.
+		int dstK = 0;
 		for (int i = 0; i < new_ydim; i++)
 		{
-			int k = 0;
 			for (int j = 0; j < xdim; j++)
 			{
-				dst[i][j] = dest[k];
-				k++;
+				dst[i][j] = dest[dstK];
+				dstK++;
 			}
 		}
 
@@ -1574,26 +1877,55 @@ public class ImageMapper {
 		int xdim = src[0].length;
 
 		int [] source = new int[xdim * ydim];
+		// BUG FIX: same "k reset inside the outer loop" mistake as the
+		// copy-back loop further down this method -- k was declared
+		// INSIDE the "i" loop, so every row overwrote source[0..xdim-1]
+		// instead of writing into its own xdim-sized slice. Only the
+		// LAST row of src ever ended up in source; everything else in
+		// source stayed at its default value of 0, which is what made
+		// avgAreaXTransform/avgAreaYTransform's actual output (verified
+		// correct in isolation) look like a mostly-zero image once it
+		// came back through this wrapper.
+		int srcK = 0;
 		for (int i = 0; i < ydim; i++)
 		{
-			int k = 0;
 			for (int j = 0; j < xdim; j++)
 			{
-				source[k] = src[i][j];
-				k++;
+				source[srcK] = src[i][j];
+				srcK++;
 			}
 		}
 		int [] intermediate = avgAreaXTransform(source, xdim, ydim, new_xdim);
 		int [] dest         = avgAreaYTransform(intermediate, new_xdim, ydim, new_ydim);
 
 		int[][] dst = new int[new_ydim][new_xdim];
+		// BUG FIX (two, in this one copy-back loop):
+		//  1) The loop previously ran "j < xdim" (the ORIGINAL, pre-shrink
+		//     width) instead of "j < new_xdim" -- harmless when
+		//     new_xdim >= xdim, but dst[i] only has new_xdim columns, so
+		//     shrinking to a smaller new_xdim (the normal case -- e.g. the
+		//     getRefinedTranslation() pyramid step calling this with
+		//     new_xdim=64 on a much larger window) walked j past the end
+		//     of dst[i] and threw ArrayIndexOutOfBoundsException.
+		//  2) "k" was declared and reset to 0 INSIDE the outer "i" loop,
+		//     so every output row read dest[0..new_xdim-1] again instead
+		//     of continuing on into dest's next new_xdim-sized chunk --
+		//     every row of the result came out identical (a full copy of
+		//     row 0), silently destroying all vertical detail. k needs to
+		//     be a single flat index that keeps advancing across the
+		//     whole new_ydim*new_xdim copy, i.e. declared outside the
+		//     outer loop.
+		// Both caught by actually running getRefinedTranslation() end to
+		// end against a real image rather than only reading the code --
+		// bug (1) crashed outright; bug (2) would otherwise have passed
+		// silently and just produced wrong (row-flattened) pyramid levels.
+		int dstK = 0;
 		for (int i = 0; i < new_ydim; i++)
 		{
-			int k = 0;
-			for (int j = 0; j < xdim; j++)
+			for (int j = 0; j < new_xdim; j++)
 			{
-				dst[i][j] = dest[k];
-				k++;
+				dst[i][j] = dest[dstK];
+				dstK++;
 			}
 		}
 
@@ -1907,7 +2239,10 @@ public class ImageMapper {
 				double x = (double) source[i][j + 1];
 				double y = (double) source[i + 1][j];
 				double z = (double) source[i + 1][j + 1];
-				dest[i][j] = (int) ((w + x + y + z) * .25);
+				// Round to nearest rather than truncate, so contract()
+				// and translate() apply the same rounding convention --
+				// see translate() below for why that consistency matters.
+				dest[i][j] = (int) ((w + x + y + z) * .25 + .5);
 			}
 		}
 		return(dest);
@@ -1931,7 +2266,18 @@ public class ImageMapper {
 			{
 				double a = (double) source[i][j] * (1. - x) + (double) source[i][j + 1] * x;
 				double b = (double) source[i + 1][j] * (1. - x) + (double) source[i + 1][j + 1] * x;
-				dest[i][j] = (int) ((a * (1. - y) + b * y) * .5 + .5);
+				// Previously "(a * (1. - y) + b * y) * .5 + .5", which
+				// halved the interpolated intensity for no evident
+				// reason -- a and b are already weighted combinations of
+				// real source pixel values, in the same range those
+				// values live in, same as contract()'s output above. The
+				// stray "* .5" is dropped; what's left is a plain
+				// bilinear sample, rounded to nearest the same way
+				// contract() now is, so current_source (built via
+				// contract()) and estimate (built via translate()) are
+				// on equal footing inside getTranslation()'s loop
+				// instead of estimate running at roughly half brightness.
+				dest[i][j] = (int) (a * (1. - y) + b * y + .5);
 			}
 		}
 		return(dest);
@@ -2062,6 +2408,146 @@ public class ImageMapper {
 		}
 		dest[0] = 3; dest[1] = xtranslation; dest[2] = ytranslation;
 		return dest;
+	}
+
+	/**
+	 * Registers source1 against source2 by repeatedly: taking the current
+	 * overlapping window from the ORIGINAL full-resolution images, pyramiding
+	 * that window down to the neighborhood of PYRAMID_TARGET x PYRAMID_TARGET,
+	 * asking getTranslation() for a subpixel correction at that coarse scale,
+	 * rescaling that correction back into full-resolution pixel units, and
+	 * using it to both accumulate the running estimate and tighten the
+	 * overlap window for the next round. Stops as soon as a round's
+	 * correction reverses direction from the previous round's, and returns
+	 * the accumulated estimate from just before that reversal.
+	 *
+	 * getTranslation() alone only resolves SUBPIXEL offsets -- see its own
+	 * "Simple version" comment, and translate()'s "-1 to 1" input range.
+	 * This method is what handles anything larger: pyramiding a window down
+	 * to ~64x64 compresses a potentially large full-resolution misalignment
+	 * into the sub-one-coarse-pixel range getTranslation() can actually
+	 * work with, and each outer round's window trim (below) handles the
+	 * integer-pixel part of the correction that getTranslation() itself
+	 * cannot.
+	 *
+	 * Sign convention: dx/dy are interpreted as "source2's content sits
+	 * dx,dy pixels further along than source1's, in source1's coordinate
+	 * frame" -- matching getTranslation()'s own internal convention (it
+	 * warps source2 toward source1). Verify this empirically against a
+	 * known synthetic shift before trusting the sign on real data; getting
+	 * it backwards would shrink the window on the wrong side but wouldn't
+	 * crash, so it's an easy thing to silently get wrong.
+	 *
+	 * Assumes fullSource1 and fullSource2 are the same size.
+	 */
+	public static double[] getRefinedTranslation(int[][] fullSource1, int[][] fullSource2)
+	{
+		final int PYRAMID_TARGET = 64;       // pyramid each working window down to roughly this size
+		final int MAX_OUTER_ITERATIONS = 40; // safety cap -- direction-reversal should stop it long before this
+
+		int fullYdim = fullSource1.length;
+		int fullXdim = fullSource1[0].length;
+
+		// Step 1: a centered square window on the longer axis. Only the
+		// window's bounds are decided here -- the pixel data itself is
+		// (re-)read fresh from fullSource1/fullSource2 every iteration below.
+		int minDim = Math.min(fullXdim, fullYdim);
+		int baseXoff = (fullXdim - minDim) / 2;
+		int baseYoff = (fullYdim - minDim) / 2;
+
+		// Each source keeps its own window into the ORIGINAL image. They
+		// start identical (zero assumed misalignment); only source2's window
+		// drifts away from source1's as the running estimate grows.
+		int x1 = baseXoff, y1 = baseYoff;
+		int x2 = baseXoff, y2 = baseYoff;
+		int windowXdim = minDim, windowYdim = minDim;
+
+		double totalXtranslation = 0;
+		double totalYtranslation = 0;
+
+		double previousDx = 0;
+		double previousDy = 0;
+		boolean firstPass = true;
+
+		for (int iteration = 0; iteration < MAX_OUTER_ITERATIONS; iteration++)
+		{
+			if (windowXdim <= PYRAMID_TARGET || windowYdim <= PYRAMID_TARGET)
+			{
+				// Window has been trimmed down close to the pyramid floor --
+				// there's nothing meaningful left to reduce.
+				break;
+			}
+
+			// "An iteration always starts with a data sample from the
+			// original images": pull fresh pixels straight from the
+			// untouched full-resolution arrays every time. Never re-pyramid
+			// an already-pyramided or already-warped array from a previous
+			// round -- that would compound smoothing/interpolation error
+			// across iterations exactly where a clean pyramid reduction is
+			// what's supposed to be suppressing sensor noise.
+			int[][] region1 = extract(fullSource1, x1, y1, windowXdim, windowYdim);
+			int[][] region2 = extract(fullSource2, x2, y2, windowXdim, windowYdim);
+
+			// Pyramid this round's fresh window down to ~PYRAMID_TARGET.
+			int[][] small1 = avgAreaTransform(region1, PYRAMID_TARGET, PYRAMID_TARGET);
+			int[][] small2 = avgAreaTransform(region2, PYRAMID_TARGET, PYRAMID_TARGET);
+
+			double[] result = getTranslation(small1, small2);
+			double coarseDx = result[1];
+			double coarseDy = result[2];
+
+			// Expand the coarse-grid subpixel estimate back into this
+			// window's own full-resolution units -- one coarse pixel here
+			// spans (windowXdim / PYRAMID_TARGET) original pixels.
+			double scaleX = (double) windowXdim / (double) PYRAMID_TARGET;
+			double scaleY = (double) windowYdim / (double) PYRAMID_TARGET;
+			double dx = coarseDx * scaleX;
+			double dy = coarseDy * scaleY;
+
+			if (!firstPass)
+			{
+				boolean xFlipped = (dx < 0 && previousDx > 0) || (dx > 0 && previousDx < 0);
+				boolean yFlipped = (dy < 0 && previousDy > 0) || (dy > 0 && previousDy < 0);
+				if (xFlipped || yFlipped)
+				{
+					// Direction reversed -- stop, and hand back the estimate
+					// from before this round rather than folding this
+					// (likely noise-driven) correction in.
+					break;
+				}
+			}
+
+			totalXtranslation += dx;
+			totalYtranslation += dy;
+			previousDx = dx;
+			previousDy = dy;
+			firstPass = false;
+
+			// "Take the overlapping rectangle from the original images":
+			// trim each source's window on whichever side just fell outside
+			// the other frame's coverage, given this round's correction.
+			// Rounding the trim up (ceil) is deliberately conservative --
+			// better to trim slightly more than the true subpixel residual
+			// than to leave a sliver of non-overlapping, fabricated border
+			// content in the next round's pyramid input.
+			int dxPixels = (int) Math.ceil(Math.abs(dx));
+			int dyPixels = (int) Math.ceil(Math.abs(dy));
+
+			if (dx > 0)      { x2 += dxPixels; }
+			else if (dx < 0) { x1 += dxPixels; }
+			if (dy > 0)      { y2 += dyPixels; }
+			else if (dy < 0) { y1 += dyPixels; }
+
+			windowXdim -= dxPixels;
+			windowYdim -= dyPixels;
+
+			if (windowXdim <= 0 || windowYdim <= 0)
+			{
+				break;
+			}
+		}
+
+		return new double[] { totalXtranslation, totalYtranslation };
 	}
 
 	public static int[][] expandX(int src[][], int expand)
