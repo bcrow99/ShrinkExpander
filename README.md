@@ -1,1 +1,1 @@
-This is code that shrinks and then expands images, using an averaging method that retains error information to restore detail.  The shrink reduces the size to 1/4, and the error information adds back another 1/8.
+This is code that shrinks and then expands images, using an averaging method that retains error information to restore detail.  The shrink reduces the size to 1/4, and the error information adds back another 1/8.  There is also some motion detection-related code that works with shrink averaging.
